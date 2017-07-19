@@ -28,12 +28,12 @@
 #include <dirent.h>
 #include <scsi/scsi.h>
 
-#include <linux/target_core_user.h>
 
 #include <libnl3/netlink/genl/genl.h>
 #include <libnl3/netlink/genl/mngt.h>
 #include <libnl3/netlink/genl/ctrl.h>
 
+#include "target_core_user_local.h"
 #include "libtcmu.h"
 #include "libtcmu_log.h"
 #include "libtcmu_priv.h"
@@ -41,42 +41,25 @@
 #include "tcmur_cmd_handler.h"
 #include "tcmu-runner.h"
 
+#define TCMU_NL_VERSION 2
+
 static struct nla_policy tcmu_attr_policy[TCMU_ATTR_MAX+1] = {
 	[TCMU_ATTR_DEVICE]	= { .type = NLA_STRING },
 	[TCMU_ATTR_MINOR]	= { .type = NLA_U32 },
+	[TCMU_ATTR_CMD_STATUS]	= { .type = NLA_S32 },
+	[TCMU_ATTR_DEVICE_ID]	= { .type = NLA_U32 },
+	[TCMU_ATTR_DEV_CFG]	= { .type = NLA_STRING },
+	[TCMU_ATTR_DEV_SIZE]	= { .type = NLA_U64 },
+	[TCMU_ATTR_WRITECACHE]	= { .type = NLA_U8 },
+	[TCMU_ATTR_SUPP_KERN_CMD_REPLY] = { .type = NLA_U8 },
 };
 
 static darray(struct tcmu_thread) g_threads = darray_new();
 
 static int add_device(struct tcmulib_context *ctx, char *dev_name, char *cfgstring);
 static void remove_device(struct tcmulib_context *ctx, char *dev_name, char *cfgstring);
-
 static int handle_netlink(struct nl_cache_ops *unused, struct genl_cmd *cmd,
-			  struct genl_info *info, void *arg)
-{
-	struct tcmulib_context *ctx = arg;
-	char buf[32];
-
-	if (!info->attrs[TCMU_ATTR_MINOR] || !info->attrs[TCMU_ATTR_DEVICE]) {
-		tcmu_err("TCMU_ATTR_MINOR or TCMU_ATTR_DEVICE not set, doing nothing\n");
-		return 0;
-	}
-
-	snprintf(buf, sizeof(buf), "uio%d", nla_get_u32(info->attrs[TCMU_ATTR_MINOR]));
-
-	switch (cmd->c_id) {
-	case TCMU_CMD_ADDED_DEVICE:
-		add_device(ctx, buf, nla_get_string(info->attrs[TCMU_ATTR_DEVICE]));
-		break;
-	case TCMU_CMD_REMOVED_DEVICE:
-		remove_device(ctx, buf, nla_get_string(info->attrs[TCMU_ATTR_DEVICE]));
-		break;
-	default:
-		tcmu_err("Unknown notification %d\n", cmd->c_id);
-	}
-
-	return 0;
-}
+			  struct genl_info *info, void *arg);
 
 static struct genl_cmd tcmu_cmds[] = {
 	{
@@ -93,6 +76,13 @@ static struct genl_cmd tcmu_cmds[] = {
 		.c_maxattr	= TCMU_ATTR_MAX,
 		.c_attr_policy	= tcmu_attr_policy,
 	},
+	{
+		.c_id		= TCMU_CMD_RECONFIG_DEVICE,
+		.c_name		= "RECONFIG DEVICE",
+		.c_msg_parser	= handle_netlink,
+		.c_maxattr	= TCMU_ATTR_MAX,
+		.c_attr_policy	= tcmu_attr_policy,
+	},
 };
 
 static struct genl_ops tcmu_ops = {
@@ -100,6 +90,196 @@ static struct genl_ops tcmu_ops = {
 	.o_cmds		= tcmu_cmds,
 	.o_ncmds	= ARRAY_SIZE(tcmu_cmds),
 };
+
+static int send_netlink_reply(struct tcmulib_context *ctx, int reply_cmd,
+			      uint32_t dev_id, int status)
+{
+	struct nl_sock *sock = ctx->nl_sock;
+	struct nl_msg *msg;
+	void *hdr;
+	int ret = -ENOMEM;
+
+	msg = nlmsg_alloc();
+	if (!msg)
+		return ret;
+
+	hdr = genlmsg_put(msg, NL_AUTO_PORT, NL_AUTO_SEQ, tcmu_ops.o_id,
+			  0, 0, reply_cmd, TCMU_NL_VERSION);
+	if (!hdr)
+		goto free_msg;
+
+	ret = nla_put_s32(msg, TCMU_ATTR_CMD_STATUS, status);
+	if (ret < 0)
+		goto free_msg;
+
+	ret = nla_put_u32(msg, TCMU_ATTR_DEVICE_ID, dev_id);
+	if (ret < 0)
+		goto free_msg;
+
+	/* Ignore ack. There is nothing we can do. */
+	ret = nl_send_auto(sock, msg);
+free_msg:
+	nlmsg_free(msg);
+
+	if (ret < 0)
+		tcmu_err("Could not send netlink cmd %d\n", reply_cmd);
+	return ret;
+}
+
+static struct tcmu_device *
+lookup_dev_by_name(struct tcmulib_context *ctx, char *dev_name, int *index)
+{
+	struct tcmu_device **dev_ptr;
+	struct tcmu_device *dev;
+	int i = 0;
+
+	*index = 0;
+
+	darray_foreach(dev_ptr, ctx->devices) {
+		dev = *dev_ptr;
+		size_t len = strnlen(dev->dev_name, sizeof(dev->dev_name));
+
+		if (!strncmp(dev->dev_name, dev_name, len)) {
+			*index = i;
+			return dev;
+		}
+		i++;
+	}
+
+	return NULL;
+}
+
+static int reconfig_device(struct tcmulib_context *ctx, char *dev_name,
+			   struct genl_info *info)
+{
+	struct tcmu_device *dev;
+	struct tcmulib_cfg_info cfg;
+	int i, ret;
+
+	memset(&cfg, 0, sizeof(cfg));
+
+	dev = lookup_dev_by_name(ctx, dev_name, &i);
+	if (!dev) {
+		tcmu_err("Could not reconfigure device %s: not found.\n",
+			 dev_name);
+		return -ENODEV;
+	}
+
+	if (!dev->handler->reconfig) {
+		tcmu_dev_err(dev, "Reconfiguration is not supported with this device.\n");
+		return -EOPNOTSUPP;
+	}
+
+	if (info->attrs[TCMU_ATTR_DEV_CFG]) {
+		cfg.type = TCMULIB_CFG_DEV_CFGSTR;
+		cfg.data.dev_cfgstring =
+				nla_get_string(info->attrs[TCMU_ATTR_DEV_CFG]);
+	} else if (info->attrs[TCMU_ATTR_DEV_SIZE]) {
+		cfg.type = TCMULIB_CFG_DEV_SIZE;
+		cfg.data.dev_size = nla_get_u64(info->attrs[TCMU_ATTR_DEV_SIZE]);
+	} else if (info->attrs[TCMU_ATTR_WRITECACHE]) {
+		cfg.type = TCMULIB_CFG_WRITE_CACHE;
+		cfg.data.write_cache =
+				nla_get_u8(info->attrs[TCMU_ATTR_WRITECACHE]);
+	} else {
+		tcmu_dev_err(dev,
+			     "Unknown reconfig attr. Try updating libtcmu.\n");
+		return -EOPNOTSUPP;
+	}
+
+	ret = dev->handler->reconfig(dev, &cfg);
+	if (ret < 0) {
+		tcmu_dev_err(dev, "Handler reconfig failed with error %d.\n",
+			     ret);
+		return ret;
+	}
+
+	return 0;
+}
+
+static int handle_netlink(struct nl_cache_ops *unused, struct genl_cmd *cmd,
+			  struct genl_info *info, void *arg)
+{
+	struct tcmulib_context *ctx = arg;
+	int ret, reply_cmd, version = info->genlhdr->version;
+	char buf[32];
+
+	tcmu_dbg("cmd %d. Got header version %d. Supported %d.\n",
+		 cmd->c_id, info->genlhdr->version, TCMU_NL_VERSION);
+
+	if (!info->attrs[TCMU_ATTR_MINOR] || !info->attrs[TCMU_ATTR_DEVICE]) {
+		tcmu_err("TCMU_ATTR_MINOR or TCMU_ATTR_DEVICE not set, dropping netlink command.\n");
+		return 0;
+	}
+
+	if (version > 1 && !info->attrs[TCMU_ATTR_DEVICE_ID]) {
+		tcmu_err("TCMU_ATTR_DEVICE_ID not set in v%d cmd %d, dropping netink command.\n", version, cmd->c_id);
+		return 0;
+	}
+
+	snprintf(buf, sizeof(buf), "uio%d", nla_get_u32(info->attrs[TCMU_ATTR_MINOR]));
+
+	switch (cmd->c_id) {
+	case TCMU_CMD_ADDED_DEVICE:
+		reply_cmd = TCMU_CMD_ADDED_DEVICE_DONE;
+		ret = add_device(ctx, buf,
+				 nla_get_string(info->attrs[TCMU_ATTR_DEVICE]));
+		break;
+	case TCMU_CMD_REMOVED_DEVICE:
+		reply_cmd = TCMU_CMD_REMOVED_DEVICE_DONE;
+		remove_device(ctx, buf,
+			      nla_get_string(info->attrs[TCMU_ATTR_DEVICE]));
+		ret = 0;
+		break;
+	case TCMU_CMD_RECONFIG_DEVICE:
+		reply_cmd = TCMU_CMD_RECONFIG_DEVICE_DONE;
+		ret = reconfig_device(ctx, buf, info);
+		break;
+	default:
+		tcmu_err("Unknown netlink command %d. Netlink header received version %d. libtcmu supports %d\n",
+			 cmd->c_id, version, TCMU_NL_VERSION);
+		return -EOPNOTSUPP;
+	}
+
+	if (version > 1)
+		ret = send_netlink_reply(ctx, reply_cmd,
+				nla_get_u32(info->attrs[TCMU_ATTR_DEVICE_ID]),
+				ret);
+
+	return ret;
+}
+
+static int set_genl_features(struct nl_sock *sock)
+{
+	struct nl_msg *msg;
+	void *hdr;
+	int ret = -ENOMEM;
+
+	msg = nlmsg_alloc();
+	if (!msg)
+		return ret;
+
+	hdr = genlmsg_put(msg, NL_AUTO_PORT, NL_AUTO_SEQ, tcmu_ops.o_id,
+			  0, NLM_F_ACK, TCMU_CMD_SET_FEATURES, TCMU_NL_VERSION);
+	if (!hdr)
+		goto free_msg;
+
+	ret = nla_put_u8(msg, TCMU_ATTR_SUPP_KERN_CMD_REPLY, 1);
+	if (ret < 0)
+		goto free_msg;
+
+	ret = nl_send_sync(sock, msg);
+	goto done;
+
+free_msg:
+	nlmsg_free(msg);
+
+done:
+	if (ret < 0)
+		tcmu_err("Could not set features. Error %d\n", ret);
+
+	return ret;
+}
 
 static struct nl_sock *setup_netlink(struct tcmulib_context *ctx)
 {
@@ -131,7 +311,7 @@ static struct nl_sock *setup_netlink(struct tcmulib_context *ctx)
 	ret = genl_ops_resolve(sock, &tcmu_ops);
 	if (ret < 0) {
 		tcmu_err("couldn't resolve ops, is target_core_user.ko loaded?\n");
-		goto err_close;
+		goto err_unregister;
 	}
 
 	ret = genl_ctrl_resolve_grp(sock, "TCM-USER", "config");
@@ -139,11 +319,19 @@ static struct nl_sock *setup_netlink(struct tcmulib_context *ctx)
 	ret = nl_socket_add_membership(sock, ret);
 	if (ret < 0) {
 		tcmu_err("couldn't add membership\n");
-		goto err_close;
+		goto err_unregister;
 	}
+
+	/*
+	 * Could be a older kernel. Ignore failure and just work in degraded
+	 * mode.
+	 */
+	set_genl_features(sock);
 
 	return sock;
 
+err_unregister:
+	genl_unregister_family(&tcmu_ops);
 err_close:
 	nl_close(sock);
 err_free:
@@ -328,24 +516,12 @@ static void close_devices(struct tcmulib_context *ctx)
 static void remove_device(struct tcmulib_context *ctx,
 			  char *dev_name, char *cfgstring)
 {
-	struct tcmu_device **dev_ptr;
 	struct tcmu_device *dev;
-	int i = 0, ret;
-	bool found = false;
+	int i, ret;
 
-	darray_foreach(dev_ptr, ctx->devices) {
-		dev = *dev_ptr;
-		size_t len = strnlen(dev->dev_name, sizeof(dev->dev_name));
-		if (strncmp(dev->dev_name, dev_name, len)) {
-			i++;
-		} else {
-			found = true;
-			break;
-		}
-	}
-
-	if (!found) {
-		tcmu_err("could not remove device %s: not found\n", dev_name);
+	dev = lookup_dev_by_name(ctx, dev_name, &i);
+	if (!dev) {
+		tcmu_err("Could not remove device %s: not found.\n", dev_name);
 		return;
 	}
 
@@ -368,34 +544,37 @@ static void remove_device(struct tcmulib_context *ctx,
 static int is_uio(const struct dirent *dirent)
 {
 	int fd;
-	char tmp_path[64];
-	char buf[256];
-	ssize_t ret;
+	char *tmp_path;
+	char buf[256] = {'\0'};
+	ssize_t ret = 0;
 
 	if (strncmp(dirent->d_name, "uio", 3))
 		return 0;
 
-	snprintf(tmp_path, sizeof(tmp_path), "/sys/class/uio/%s/name", dirent->d_name);
+	if (asprintf(&tmp_path, "/sys/class/uio/%s/name", dirent->d_name) == -1)
+		return 0;
 
 	fd = open(tmp_path, O_RDONLY);
 	if (fd == -1)
-		return 0;
+		goto free_path;
 
 	ret = read(fd, buf, sizeof(buf));
 	if (ret <= 0 || ret >= sizeof(buf))
-		goto not_uio;
+		goto close;
 
 	buf[ret-1] = '\0'; /* null-terminate and chop off the \n */
 
 	/* we only want uio devices whose name is a format we expect */
 	if (strncmp(buf, "tcm-user", 8))
-		goto not_uio;
+		goto close;
 
+	ret = 1;
+
+close:
 	close(fd);
-	return 1;
-not_uio:
-	close(fd);
-	return 0;
+free_path:
+	free(tmp_path);
+	return ret;
 }
 
 static int open_devices(struct tcmulib_context *ctx)
@@ -411,17 +590,19 @@ static int open_devices(struct tcmulib_context *ctx)
 		return -1;
 
 	for (i = 0; i < num_devs; i++) {
-		char tmp_path[64];
-		char buf[256];
+		char *tmp_path;
+		char buf[256] = {'\0'};
 		int fd;
 		int ret;
 
-		snprintf(tmp_path, sizeof(tmp_path), "/sys/class/uio/%s/name",
-			 dirent_list[i]->d_name);
+		if (asprintf(&tmp_path, "/sys/class/uio/%s/name",
+		             dirent_list[i]->d_name) == -1)
+			return -1;
 
 		fd = open(tmp_path, O_RDONLY);
 		if (fd == -1) {
 			tcmu_err("could not open %s!\n", tmp_path);
+			free(tmp_path);
 			continue;
 		}
 
@@ -429,8 +610,10 @@ static int open_devices(struct tcmulib_context *ctx)
 		close(fd);
 		if (ret <= 0 || ret >= sizeof(buf)) {
 			tcmu_err("read of %s had issues\n", tmp_path);
+			free(tmp_path);
 			continue;
 		}
+		free(tmp_path);
 		buf[ret-1] = '\0'; /* null-terminate and chop off the \n */
 
 		ret = add_device(ctx, dirent_list[i]->d_name, buf);
@@ -479,6 +662,8 @@ struct tcmulib_context *tcmulib_initialize(
 		teardown_netlink(ctx->nl_sock);
 		darray_free(ctx->handlers);
 		darray_free(ctx->devices);
+		genl_unregister_family(&tcmu_ops);
+		free(ctx);
 		return NULL;
 	}
 
@@ -537,6 +722,20 @@ void tcmu_set_dev_num_lbas(struct tcmu_device *dev, uint64_t num_lbas)
 uint64_t tcmu_get_dev_num_lbas(struct tcmu_device *dev)
 {
 	return dev->num_lbas;
+}
+
+/**
+ * tcmu_update_num_lbas - Update num LBAs based on the new size.
+ * @dev: tcmu device to update
+ * @new_size: new device size in bytes
+ */
+int tcmu_update_num_lbas(struct tcmu_device *dev, uint64_t new_size)
+{
+	if (!new_size)
+		return -EINVAL;
+
+	tcmu_set_dev_num_lbas(dev, new_size / tcmu_get_dev_block_size(dev));
+	return 0;
 }
 
 void tcmu_set_dev_block_size(struct tcmu_device *dev, uint32_t block_size)

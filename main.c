@@ -41,7 +41,7 @@
 
 #include <libkmod.h>
 #include <sys/utsname.h>
-#include <linux/target_core_user.h>
+#include "target_core_user_local.h"
 #include "darray.h"
 #include "tcmu-runner.h"
 #include "tcmur_aio.h"
@@ -56,6 +56,8 @@
 static char *handler_path = DEFAULT_HANDLER_PATH;
 /* tcmu log dir path */
 extern char *tcmu_log_dir;
+
+static struct tcmu_config *tcmu_cfg;
 
 darray(struct tcmur_handler *) g_runner_handlers = darray_new();
 
@@ -165,6 +167,7 @@ static void sighandler(int signal)
 {
 	tcmulib_cleanup_all_cmdproc_threads();
 	tcmu_cancel_log_thread();
+	tcmu_cancel_config_thread(tcmu_cfg);
 	exit(1);
 }
 
@@ -464,9 +467,9 @@ static int load_our_module(void)
 {
 	struct kmod_list *list = NULL, *itr;
 	struct kmod_ctx *ctx;
-	int ret;
 	struct stat sb;
 	struct utsname u;
+	int ret;
 
 	ctx = kmod_new(NULL, NULL);
 	if (!ctx) {
@@ -559,10 +562,10 @@ static void cmdproc_thread_cleanup(void *arg)
 
 static void *tcmur_cmdproc_thread(void *arg)
 {
-        int ret;
 	struct tcmu_device *dev = arg;
 	struct tcmur_handler *rhandler = tcmu_get_runner_handler(dev);
 	struct pollfd pfd;
+	int ret;
 
 	pthread_cleanup_push(cmdproc_thread_cleanup, dev);
 
@@ -779,22 +782,24 @@ static struct option long_options[] = {
 
 int main(int argc, char **argv)
 {
-	int ret;
+	darray(struct tcmulib_handler) handlers = darray_new();
+	struct tcmulib_context *tcmulib_context;
+	struct tcmur_handler **tmp_r_handler;
 	GMainLoop *loop;
 	GIOChannel *libtcmu_gio;
 	guint reg_id;
-	int c;
-	struct tcmulib_context *tcmulib_context;
-	darray(struct tcmulib_handler) handlers = darray_new();
-	struct tcmur_handler **tmp_r_handler;
-	struct tcmu_config *cfg;
+	int ret;
 
-	cfg = tcmu_config_new();
-	tcmu_load_config(cfg, NULL);
-	tcmu_set_log_level(cfg->log_level);
+	tcmu_cfg = tcmu_config_new();
+	if (!tcmu_cfg)
+		exit(1);
+	ret = tcmu_load_config(tcmu_cfg, NULL);
+	if (ret == -1)
+		goto err_out;
 
 	while (1) {
 		int option_index = 0;
+		int c;
 
 		c = getopt_long(argc, argv, "dhlV",
 				long_options, &option_index);
@@ -812,7 +817,7 @@ int main(int argc, char **argv)
 				         optarg, PATH_MAX - TCMU_LOG_FILENAME_MAX);
 			}
 			if (!tcmu_logdir_create(optarg)) {
-				exit(1);
+				goto err_out;
 			}
 			tcmu_log_dir = strdup(optarg);
 			break;
@@ -821,11 +826,11 @@ int main(int argc, char **argv)
 			break;
 		case 'V':
 			printf("tcmu-runner %s\n", TCMUR_VERSION);
-			exit(1);
+			goto err_out;
 		default:
 		case 'h':
 			usage();
-			exit(1);
+			goto err_out;
 		}
 	}
 
@@ -834,13 +839,13 @@ int main(int argc, char **argv)
 	ret = load_our_module();
 	if (ret < 0) {
 		tcmu_err("couldn't load module\n");
-		exit(1);
+		goto err_out;
 	}
 
 	ret = open_handlers();
 	if (ret < 0) {
 		tcmu_err("couldn't open handlers\n");
-		exit(1);
+		goto err_out;
 	}
 	tcmu_dbg("%d runner handlers found\n", ret);
 
@@ -855,6 +860,7 @@ int main(int argc, char **argv)
 		tmp_handler.subtype = (*tmp_r_handler)->subtype;
 		tmp_handler.cfg_desc = (*tmp_r_handler)->cfg_desc;
 		tmp_handler.check_config = (*tmp_r_handler)->check_config;
+		tmp_handler.reconfig = (*tmp_r_handler)->reconfig;
 		tmp_handler.added = dev_added;
 		tmp_handler.removed = dev_removed;
 
@@ -871,13 +877,13 @@ int main(int argc, char **argv)
 	tcmulib_context = tcmulib_initialize(handlers.item, handlers.size);
 	if (!tcmulib_context) {
 		tcmu_err("tcmulib_initialize failed\n");
-		exit(1);
+		goto err_out;
 	}
 
 	ret = sigaction(SIGINT, &tcmu_sigaction, NULL);
 	if (ret) {
 		tcmu_err("couldn't set sigaction\n");
-		exit(1);
+		goto err_tcmulib_close;
 	}
 
 	/* Set up event for libtcmu */
@@ -901,7 +907,14 @@ int main(int argc, char **argv)
 	tcmu_dbg("Exiting...\n");
 	g_bus_unown_name(reg_id);
 	g_main_loop_unref(loop);
-	tcmu_config_destroy(cfg);
+	tcmulib_close(tcmulib_context);
+	tcmu_config_destroy(tcmu_cfg);
 
 	return 0;
+
+err_tcmulib_close:
+	tcmulib_close(tcmulib_context);
+err_out:
+	tcmu_config_destroy(tcmu_cfg);
+	exit(1);
 }
